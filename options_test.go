@@ -22,13 +22,14 @@ package mqtt
 
 import (
 	"fmt"
-	"net"
 	"net/url"
 	"testing"
+
+	"github.com/quic-go/quic-go"
 )
 
 func TestSetCustomConnectionOptions(t *testing.T) {
-	var customConnectionFunc OpenConnectionFunc = func(uri *url.URL, options ClientOptions) (net.Conn, error) {
+	var customConnectionFunc OpenConnectionFunc = func(uri *url.URL, options ClientOptions) (quic.Stream, error) {
 		return nil, fmt.Errorf("not implemented open connection func")
 	}
 	options := &ClientOptions{}

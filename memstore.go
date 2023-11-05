@@ -62,6 +62,7 @@ func (store *MemoryStore) Put(key string, message packets.ControlPacket) {
 		return
 	}
 	store.messages[key] = message
+	DEBUG.Println(store.messages)
 }
 
 // Get takes a key and looks in the store for a matching Message

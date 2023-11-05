@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/eclipse/paho.mqtt.golang/packets"
+	"github.com/quic-go/quic-go"
 )
 
 const closedNetConnErrorText = "use of closed network connection" // error string for closed conn (https://golang.org/src/net/error_test.go)
@@ -153,11 +154,11 @@ type incomingComms struct {
 // Accepts a channel of inbound messages from the store (persisted messages); note this must be closed as soon as
 // everything in the store has been sent.
 // Returns a channel that will be passed any received packets; this will be closed on a network error (and inboundFromStore closed)
-func startIncomingComms(conn io.Reader,
+func startIncomingComms(stream io.Reader,
 	c commsFns,
 	inboundFromStore <-chan packets.ControlPacket,
 ) <-chan incomingComms {
-	ibound := startIncoming(conn) // Start goroutine that reads from network connection
+	ibound := startIncoming(stream) // Start goroutine that reads from network connection
 	output := make(chan incomingComms)
 
 	DEBUG.Println(NET, "startIncomingComms started")
@@ -252,7 +253,7 @@ func startIncomingComms(conn io.Reader,
 // directly from incoming comms).
 // Returns a channel that will receive details of any errors (closed when the goroutine exits)
 // This function wil only terminate when all input channels are closed
-func startOutgoingComms(conn net.Conn,
+func startOutgoingComms(stream quic.Stream,
 	c commsFns,
 	oboundp <-chan *PacketAndToken,
 	obound <-chan *PacketAndToken,
@@ -285,12 +286,12 @@ func startOutgoingComms(conn net.Conn,
 
 				writeTimeout := c.getWriteTimeOut()
 				if writeTimeout > 0 {
-					if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+					if err := stream.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
 						ERROR.Println(NET, "SetWriteDeadline ", err)
 					}
 				}
 
-				if err := msg.Write(conn); err != nil {
+				if err := msg.Write(stream); err != nil {
 					ERROR.Println(NET, "outgoing obound reporting error ", err)
 					pub.t.setError(err)
 					// report error if it's not due to the connection being closed elsewhere
@@ -303,7 +304,7 @@ func startOutgoingComms(conn net.Conn,
 				if writeTimeout > 0 {
 					// If we successfully wrote, we don't want the timeout to happen during an idle period
 					// so we reset it to infinite.
-					if err := conn.SetWriteDeadline(time.Time{}); err != nil {
+					if err := stream.SetWriteDeadline(time.Time{}); err != nil {
 						ERROR.Println(NET, "SetWriteDeadline to 0 ", err)
 					}
 				}
@@ -318,7 +319,7 @@ func startOutgoingComms(conn net.Conn,
 					continue
 				}
 				DEBUG.Println(NET, "obound priority msg to write, type", reflect.TypeOf(msg.p))
-				if err := msg.p.Write(conn); err != nil {
+				if err := msg.p.Write(stream); err != nil {
 					ERROR.Println(NET, "outgoing oboundp reporting error ", err)
 					if msg.t != nil {
 						msg.t.setError(err)
@@ -332,7 +333,7 @@ func startOutgoingComms(conn net.Conn,
 					DEBUG.Println(NET, "outbound wrote disconnect, closing connection")
 					// As per the MQTT spec "After sending a DISCONNECT Packet the Client MUST close the Network Connection"
 					// Closing the connection will cause the goroutines to end in sequence (starting with incoming comms)
-					_ = conn.Close()
+					_ = stream.Close()
 				}
 			case msg, ok := <-oboundFromIncoming: // message triggered by an inbound message (PubrecPacket or PubrelPacket)
 				if !ok {
@@ -340,7 +341,7 @@ func startOutgoingComms(conn net.Conn,
 					continue
 				}
 				DEBUG.Println(NET, "obound from incoming msg to write, type", reflect.TypeOf(msg.p), " ID ", msg.p.Details().MessageID)
-				if err := msg.p.Write(conn); err != nil {
+				if err := msg.p.Write(stream); err != nil {
 					ERROR.Println(NET, "outgoing oboundFromIncoming reporting error", err)
 					if msg.t != nil {
 						msg.t.setError(err)
@@ -378,7 +379,7 @@ type commsFns interface {
 // Note: The comms routines monitoring oboundp and obound will not shutdown until those channels are both closed. Any messages received between the
 // connection being closed and those channels being closed will generate errors (and nothing will be sent). That way the chance of a deadlock is
 // minimised.
-func startComms(conn net.Conn, // Network connection (must be active)
+func startComms(stream quic.Stream, // Network connection (must be active)
 	c commsFns, // getters and setters to enable us to cleanly interact with client
 	inboundFromStore <-chan packets.ControlPacket, // Inbound packets from the persistence store (should be closed relatively soon after startup)
 	oboundp <-chan *PacketAndToken,
@@ -387,11 +388,11 @@ func startComms(conn net.Conn, // Network connection (must be active)
 	<-chan error, // Any errors (should generally trigger a disconnect)
 ) {
 	// Start inbound comms handler; this needs to be able to transmit messages so we start a go routine to add these to the priority outbound channel
-	ibound := startIncomingComms(conn, c, inboundFromStore)
+	ibound := startIncomingComms(stream, c, inboundFromStore)
 	outboundFromIncoming := make(chan *PacketAndToken) // Will accept outgoing messages triggered by startIncomingComms (e.g. acknowledgements)
 
 	// Start the outgoing handler. It is important to note that output from startIncomingComms is fed into startOutgoingComms (for ACK's)
-	oboundErr := startOutgoingComms(conn, c, oboundp, obound, outboundFromIncoming)
+	oboundErr := startOutgoingComms(stream, c, oboundp, obound, outboundFromIncoming)
 	DEBUG.Println(NET, "startComms started")
 
 	// Run up go routines to handle the output from the above comms functions - these are handled in separate

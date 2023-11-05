@@ -1553,7 +1553,7 @@ func Test_DisconnectWhileProcessingIncomingPublish(t *testing.T) {
 	// We need the connection to drop; unfortunately using any internal method (`s.conn.Close()` etc) will hide the
 	// behaviour because any calls to Read/Write will return immediately. So we just ask the broker to disconnect..
 	dm := packets.NewControlPacket(packets.Disconnect).(*packets.DisconnectPacket)
-	err := dm.Write(s.conn)
+	err := dm.Write(s.stream)
 	if err != nil {
 		t.Fatalf("error sending disconnect packet: %s", err)
 	}

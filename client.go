@@ -36,6 +36,7 @@ import (
 	"golang.org/x/sync/semaphore"
 
 	"github.com/eclipse/paho.mqtt.golang/packets"
+	"github.com/quic-go/quic-go"
 )
 
 // Client is the interface definition for a Client as used by this
@@ -135,7 +136,7 @@ type client struct {
 	options   ClientOptions
 	optionsMu sync.Mutex // Protects the options in a few limited cases where needed for testing
 
-	conn   net.Conn   // the network connection, must only be set with connMu locked (only used when starting/stopping workers)
+	stream quic.Stream
 	connMu sync.Mutex // mutex for the connection (again only used in two functions)
 
 	stop         chan struct{}  // Closed to request that workers stop
@@ -152,6 +153,9 @@ type client struct {
 func NewClient(o *ClientOptions) Client {
 	c := &client{}
 	c.options = *o
+	if c.options.TLSConfig != nil {
+		c.options.TLSConfig.InsecureSkipVerify = true
+	}
 
 	if c.options.Store == nil {
 		c.options.Store = NewMemoryStore()
@@ -259,10 +263,10 @@ func (c *client) Connect() Token {
 		}
 
 	RETRYCONN:
-		var conn net.Conn
+		var stream quic.Stream
 		var rc byte
 		var err error
-		conn, rc, t.sessionPresent, err = c.attemptConnection()
+		stream, rc, t.sessionPresent, err = c.attemptConnection()
 		if err != nil {
 			if c.options.ConnectRetry {
 				DEBUG.Println(CLI, "Connect failed, sleeping for", int(c.options.ConnectRetryInterval.Seconds()), "seconds and will then retry, error:", err.Error())
@@ -281,8 +285,8 @@ func (c *client) Connect() Token {
 			}
 			return
 		}
-		inboundFromStore := make(chan packets.ControlPacket)           // there may be some inbound comms packets in the store that are awaiting processing
-		if c.startCommsWorkers(conn, connectionUp, inboundFromStore) { // note that this takes care of updating the status (to connected or disconnected)
+		inboundFromStore := make(chan packets.ControlPacket)             // there may be some inbound comms packets in the store that are awaiting processing
+		if c.startCommsWorkers(stream, connectionUp, inboundFromStore) { // note that this takes care of updating the status (to connected or disconnected)
 			// Take care of any messages in the store
 			if !c.options.CleanSession {
 				c.resume(c.options.ResumeSubs, inboundFromStore)
@@ -306,7 +310,7 @@ func (c *client) reconnect(connectionUp connCompletedFn) {
 	DEBUG.Println(CLI, "enter reconnect")
 	var (
 		initSleep = 1 * time.Second
-		conn      net.Conn
+		stream    quic.Stream
 	)
 
 	// If the reason of connection lost is same as the before one, sleep timer is set before attempting connection is started.
@@ -320,7 +324,7 @@ func (c *client) reconnect(connectionUp connCompletedFn) {
 			c.options.OnReconnecting(c, &c.options)
 		}
 		var err error
-		conn, _, _, err = c.attemptConnection()
+		stream, _, _, err = c.attemptConnection()
 		if err == nil {
 			break
 		}
@@ -336,8 +340,8 @@ func (c *client) reconnect(connectionUp connCompletedFn) {
 		}
 	}
 
-	inboundFromStore := make(chan packets.ControlPacket)           // there may be some inbound comms packets in the store that are awaiting processing
-	if c.startCommsWorkers(conn, connectionUp, inboundFromStore) { // note that this takes care of updating the status (to connected or disconnected)
+	inboundFromStore := make(chan packets.ControlPacket)             // there may be some inbound comms packets in the store that are awaiting processing
+	if c.startCommsWorkers(stream, connectionUp, inboundFromStore) { // note that this takes care of updating the status (to connected or disconnected)
 		c.resume(c.options.ResumeSubs, inboundFromStore)
 	}
 	close(inboundFromStore)
@@ -351,11 +355,11 @@ func (c *client) reconnect(connectionUp connCompletedFn) {
 // byte - Return code (packets.Accepted indicates a successful connection).
 // bool - SessionPresent flag from the connect ack (only valid if packets.Accepted)
 // err - Error (err != nil guarantees that conn has been set to active connection).
-func (c *client) attemptConnection() (net.Conn, byte, bool, error) {
+func (c *client) attemptConnection() (quic.Stream, byte, bool, error) {
 	protocolVersion := c.options.ProtocolVersion
 	var (
 		sessionPresent bool
-		conn           net.Conn
+		stream         quic.Stream
 		err            error
 		rc             byte
 	)
@@ -380,9 +384,9 @@ func (c *client) attemptConnection() (net.Conn, byte, bool, error) {
 		}
 		// Start by opening the network connection (tcp, tls, ws) etc
 		if c.options.CustomOpenConnectionFn != nil {
-			conn, err = c.options.CustomOpenConnectionFn(broker, c.options)
+			stream, err = c.options.CustomOpenConnectionFn(broker, c.options)
 		} else {
-			conn, err = openConnection(broker, tlsCfg, c.options.ConnectTimeout, c.options.HTTPHeaders, c.options.WebsocketOptions, dialer)
+			stream, err = openConnection(broker, tlsCfg, c.options.ConnectTimeout, c.options.HTTPHeaders, c.options.WebsocketOptions, dialer)
 		}
 		if err != nil {
 			ERROR.Println(CLI, err.Error())
@@ -393,21 +397,21 @@ func (c *client) attemptConnection() (net.Conn, byte, bool, error) {
 		DEBUG.Println(CLI, "socket connected to broker")
 
 		// Now we perform the MQTT connection handshake ensuring that it does not exceed the timeout
-		if err := conn.SetDeadline(connDeadline); err != nil {
+		if err := stream.SetDeadline(connDeadline); err != nil {
 			ERROR.Println(CLI, "set deadline for handshake ", err)
 		}
 
 		// Now we perform the MQTT connection handshake
-		rc, sessionPresent, err = connectMQTT(conn, cm, protocolVersion)
+		rc, sessionPresent, err = connectMQTT(stream, cm, protocolVersion)
 		if rc == packets.Accepted {
-			if err := conn.SetDeadline(time.Time{}); err != nil {
+			if err := stream.SetDeadline(time.Time{}); err != nil {
 				ERROR.Println(CLI, "reset deadline following handshake ", err)
 			}
 			break // successfully connected
 		}
 
 		// We may have to attempt the connection with MQTT 3.1
-		_ = conn.Close()
+		_ = stream.Close()
 
 		if !c.options.protocolVersionExplicit && protocolVersion == 4 { // try falling back to 3.1?
 			DEBUG.Println(CLI, "Trying reconnect using MQTT 3.1 protocol")
@@ -430,7 +434,7 @@ func (c *client) attemptConnection() (net.Conn, byte, bool, error) {
 			err = fmt.Errorf("%w : %w", packets.ConnErrors[rc], err)
 		}
 	}
-	return conn, rc, sessionPresent, err
+	return stream, rc, sessionPresent, err
 }
 
 // Disconnect will end the connection with the server, but not before waiting
@@ -572,19 +576,19 @@ func (c *client) internalConnLost(whyConnLost error) {
 // It starts off the routines needed to process incoming and outgoing messages.
 // Returns true if the comms workers were started (i.e. successful connection)
 // connectionUp(true) will be called once everything is up;  connectionUp(false) will be called on failure
-func (c *client) startCommsWorkers(conn net.Conn, connectionUp connCompletedFn, inboundFromStore <-chan packets.ControlPacket) bool {
+func (c *client) startCommsWorkers(stream quic.Stream, connectionUp connCompletedFn, inboundFromStore <-chan packets.ControlPacket) bool {
 	DEBUG.Println(CLI, "startCommsWorkers called")
 	c.connMu.Lock()
 	defer c.connMu.Unlock()
-	if c.conn != nil { // Should never happen due to new status handling; leaving in for safety for the time being
+	if c.stream != nil { // Should never happen due to new status handling; leaving in for safety for the time being
 		WARN.Println(CLI, "startCommsWorkers called when commsworkers already running BUG BUG")
-		_ = conn.Close() // No use for the new network connection
+		_ = stream.Close() // No use for the new network connection
 		if err := connectionUp(false); err != nil {
 			ERROR.Println(CLI, err.Error())
 		}
 		return false
 	}
-	c.conn = conn // Store the connection
+	c.stream = stream // Store the connection
 
 	c.stop = make(chan struct{})
 	if c.options.KeepAlive != 0 {
@@ -592,7 +596,7 @@ func (c *client) startCommsWorkers(conn net.Conn, connectionUp connCompletedFn, 
 		c.lastReceived.Store(time.Now())
 		c.lastSent.Store(time.Now())
 		c.workers.Add(1)
-		go keepalive(c, conn)
+		go keepalive(c, c.stream)
 	}
 
 	// matchAndDispatch will process messages received from the network. It may generate acknowledgements
@@ -608,8 +612,8 @@ func (c *client) startCommsWorkers(conn net.Conn, connectionUp connCompletedFn, 
 		close(c.stop) // Tidy up anything we have already started
 		close(incomingPubChan)
 		c.workers.Wait()
-		c.conn.Close()
-		c.conn = nil
+		c.stream.Close()
+		c.stream = nil
 		return false
 	}
 	DEBUG.Println(CLI, "client is connected/reconnected")
@@ -655,7 +659,7 @@ func (c *client) startCommsWorkers(conn net.Conn, connectionUp connCompletedFn, 
 		}
 	}()
 
-	commsIncomingPub, commsErrors := startComms(c.conn, c, inboundFromStore, commsoboundP, commsobound)
+	commsIncomingPub, commsErrors := startComms(c.stream, c, inboundFromStore, commsoboundP, commsobound)
 	c.commsStopped = make(chan struct{})
 	go func() {
 		for {
@@ -711,7 +715,7 @@ func (c *client) stopCommsWorkers() chan struct{} {
 	DEBUG.Println(CLI, "stopCommsWorkers called")
 	// It is possible that this function will be called multiple times simultaneously due to the way things get shutdown
 	c.connMu.Lock()
-	if c.conn == nil {
+	if c.stream == nil {
 		DEBUG.Println(CLI, "stopCommsWorkers done (not running)")
 		c.connMu.Unlock()
 		return nil
@@ -725,8 +729,8 @@ func (c *client) stopCommsWorkers() chan struct{} {
 
 	// We stop all non-comms related workers first (ping, keepalive, errwatch, resume etc) so they don't get blocked waiting on comms
 	close(c.stop)     // Signal for workers to stop
-	c.conn.Close()    // Possible that this is already closed but no harm in closing again
-	c.conn = nil      // Important that this is the only place that this is set to nil
+	c.stream.Close()  // Possible that this is already closed but no harm in closing again
+	c.stream = nil    // Important that this is the only place that this is set to nil
 	c.connMu.Unlock() // As the connection is now nil we can unlock the mu (allowing subsequent calls to exit immediately)
 
 	doneChan := make(chan struct{})

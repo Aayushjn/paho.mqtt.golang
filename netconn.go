@@ -20,15 +20,14 @@
 package mqtt
 
 import (
+	"context"
 	"crypto/tls"
-	"errors"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"time"
 
-	"golang.org/x/net/proxy"
+	"github.com/quic-go/quic-go"
 )
 
 //
@@ -37,74 +36,18 @@ import (
 
 // openConnection opens a network connection using the protocol indicated in the URL.
 // Does not carry out any MQTT specific handshakes.
-func openConnection(uri *url.URL, tlsc *tls.Config, timeout time.Duration, headers http.Header, websocketOptions *WebsocketOptions, dialer *net.Dialer) (net.Conn, error) {
-	switch uri.Scheme {
-	case "ws":
-		dialURI := *uri // #623 - Gorilla Websockets does not accept URL's where uri.User != nil
-		dialURI.User = nil
-		conn, err := NewWebsocket(dialURI.String(), nil, timeout, headers, websocketOptions)
-		return conn, err
-	case "wss":
-		dialURI := *uri // #623 - Gorilla Websockets does not accept URL's where uri.User != nil
-		dialURI.User = nil
-		conn, err := NewWebsocket(dialURI.String(), tlsc, timeout, headers, websocketOptions)
-		return conn, err
-	case "mqtt", "tcp":
-		allProxy := os.Getenv("all_proxy")
-		if len(allProxy) == 0 {
-			conn, err := dialer.Dial("tcp", uri.Host)
-			if err != nil {
-				return nil, err
-			}
-			return conn, nil
-		}
-		proxyDialer := proxy.FromEnvironment()
-
-		conn, err := proxyDialer.Dial("tcp", uri.Host)
-		if err != nil {
-			return nil, err
-		}
-		return conn, nil
-	case "unix":
-		var conn net.Conn
-		var err error
-
-		// this check is preserved for compatibility with older versions
-		// which used uri.Host only (it works for local paths, e.g. unix://socket.sock in current dir)
-		if len(uri.Host) > 0 {
-			conn, err = dialer.Dial("unix", uri.Host)
-		} else {
-			conn, err = dialer.Dial("unix", uri.Path)
-		}
-
-		if err != nil {
-			return nil, err
-		}
-		return conn, nil
-	case "ssl", "tls", "mqtts", "mqtt+ssl", "tcps":
-		allProxy := os.Getenv("all_proxy")
-		if len(allProxy) == 0 {
-			conn, err := tls.DialWithDialer(dialer, "tcp", uri.Host, tlsc)
-			if err != nil {
-				return nil, err
-			}
-			return conn, nil
-		}
-		proxyDialer := proxy.FromEnvironment()
-		conn, err := proxyDialer.Dial("tcp", uri.Host)
-		if err != nil {
-			return nil, err
-		}
-
-		tlsConn := tls.Client(conn, tlsc)
-
-		err = tlsConn.Handshake()
-		if err != nil {
-			_ = conn.Close()
-			return nil, err
-		}
-
-		return tlsConn, nil
+func openConnection(uri *url.URL, tlsc *tls.Config, timeout time.Duration, headers http.Header, websocketOptions *WebsocketOptions, dialer *net.Dialer) (quic.Stream, error) {
+	quicConfig := &quic.Config{
+		Allow0RTT: true,
 	}
-	return nil, errors.New("unknown protocol")
+
+	conn, err := quic.DialAddrEarly(context.Background(), uri.Host, tlsc, quicConfig)
+	if err != nil {
+		return nil, err
+	}
+	stream, err := conn.OpenStreamSync(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	return stream, err
 }
